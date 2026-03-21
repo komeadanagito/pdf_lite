@@ -1,10 +1,11 @@
 use std::{
   fs,
-  io::Cursor,
+  io::{Cursor, Read as _},
   path::{Path, PathBuf},
   time::Instant,
 };
 
+use flate2::read::ZlibDecoder;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage};
 use lopdf::{Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
@@ -25,16 +26,15 @@ pub enum CompressionMode {
 }
 
 impl CompressionMode {
-  pub fn from_u8(value: u8) -> Result<Self, String> {
-    match value {
+  pub fn from_u8(v: u8) -> Result<Self, String> {
+    match v {
       0 => Ok(Self::Lossless),
       1 => Ok(Self::Light),
       2 => Ok(Self::Standard),
       3 => Ok(Self::Extreme),
-      _ => Err(format!("invalid compression mode: {}", value)),
+      _ => Err(format!("invalid compression mode: {v}")),
     }
   }
-
   pub fn label(self) -> &'static str {
     match self {
       Self::Lossless => "lossless",
@@ -79,30 +79,25 @@ struct ProgressEvent {
 }
 
 pub fn get_pdf_info_for_path(path: &Path) -> Result<PdfInfo, String> {
-  let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+  let meta = fs::metadata(path).map_err(|e| e.to_string())?;
   let doc = Document::load(path).map_err(|e| e.to_string())?;
   let pages = doc.get_pages().len();
-  let file_name = path
-    .file_name()
-    .and_then(|n| n.to_str())
-    .unwrap_or("document.pdf")
-    .to_string();
-  let info = info_dictionary(&doc);
-
+  let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("document.pdf").to_string();
+  let info = info_dict(&doc);
   Ok(PdfInfo {
     path: path.to_string_lossy().to_string(),
-    file_name,
+    file_name: fname,
     pages,
-    size_bytes: metadata.len(),
-    title: info.as_ref().and_then(|d| dict_string(d, b"Title")),
-    author: info.as_ref().and_then(|d| dict_string(d, b"Author")),
-    creator: info.as_ref().and_then(|d| dict_string(d, b"Creator")),
-    producer: info.as_ref().and_then(|d| dict_string(d, b"Producer")),
+    size_bytes: meta.len(),
+    title: info.as_ref().and_then(|d| dstr(d, b"Title")),
+    author: info.as_ref().and_then(|d| dstr(d, b"Author")),
+    creator: info.as_ref().and_then(|d| dstr(d, b"Creator")),
+    producer: info.as_ref().and_then(|d| dstr(d, b"Producer")),
     version: Some(doc.version),
   })
 }
 
-// ─── Main compress entry ───────────────────────────────────────────
+// ─── Main entry ────────────────────────────────────────────────────
 
 pub fn compress_pdf_at_path(
   app: &AppHandle,
@@ -137,15 +132,15 @@ pub fn compress_pdf_at_path(
     }
   }
 
-  let output_path = output_path_for(path);
-  if output_path.exists() {
-    let _ = fs::remove_file(&output_path);
+  let output = output_path_for(path);
+  if output.exists() {
+    let _ = fs::remove_file(&output);
   }
-  doc.save(&output_path).map_err(|e| e.to_string())?;
+  doc.save(&output).map_err(|e| e.to_string())?;
 
-  let mut compressed_size = fs::metadata(&output_path).map_err(|e| e.to_string())?.len();
+  let mut compressed_size = fs::metadata(&output).map_err(|e| e.to_string())?.len();
   if compressed_size >= original_size {
-    fs::copy(path, &output_path).map_err(|e| e.to_string())?;
+    fs::copy(path, &output).map_err(|e| e.to_string())?;
     compressed_size = original_size;
   }
 
@@ -153,13 +148,11 @@ pub fn compress_pdf_at_path(
 
   Ok(CompressResult {
     input_path: path.to_string_lossy().to_string(),
-    output_path: output_path.to_string_lossy().to_string(),
+    output_path: output.to_string_lossy().to_string(),
     original_size,
     compressed_size,
     saved_bytes: original_size as i64 - compressed_size as i64,
-    compression_ratio: if original_size == 0 {
-      0.0
-    } else {
+    compression_ratio: if original_size == 0 { 0.0 } else {
       (1.0 - compressed_size as f64 / original_size as f64) * 100.0
     },
     mode: mode.label().to_string(),
@@ -169,12 +162,15 @@ pub fn compress_pdf_at_path(
 
 // ─── Image recompression ───────────────────────────────────────────
 
-struct ImageTask {
+struct ImgTask {
   id: ObjectId,
-  jpeg_bytes: Vec<u8>,
-  original_len: usize,
-  width: u32,
-  height: u32,
+  /// Raw pixel data (decoded from whatever filter the stream used)
+  pixels: Vec<u8>,
+  w: u32,
+  h: u32,
+  components: usize,
+  /// Original compressed stream length (for size comparison)
+  original_stream_len: usize,
 }
 
 fn recompress_images(
@@ -184,193 +180,197 @@ fn recompress_images(
   quality: u8,
   max_dim: Option<u32>,
 ) -> Result<(), String> {
-  // Phase 1: Find image streams and decode them using lopdf's built-in decompression
   let image_ids: Vec<ObjectId> = doc
     .objects
     .iter()
     .filter_map(|(id, obj)| match obj {
-      Object::Stream(s) if is_image_stream(s) => Some(*id),
+      Object::Stream(s) if is_image(s) => Some(*id),
       _ => None,
     })
     .collect();
 
-  // Decompress all streams in-place first (lopdf handles zlib, predictors, etc.)
-  for &id in &image_ids {
-    if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
-      let _ = stream.decompress();
-    }
-  }
+  let mut tasks: Vec<ImgTask> = Vec::new();
 
-  // Build tasks: extract decoded bytes + metadata
-  let mut tasks: Vec<ImageTask> = Vec::new();
   for &id in &image_ids {
     let stream = match doc.objects.get(&id) {
       Some(Object::Stream(s)) => s,
       _ => continue,
     };
 
-    let w = dict_int(&stream.dict, b"Width").unwrap_or(0) as u32;
-    let h = dict_int(&stream.dict, b"Height").unwrap_or(0) as u32;
-    if w == 0 || h == 0 {
+    let w = dint(&stream.dict, b"Width").unwrap_or(0) as u32;
+    let h = dint(&stream.dict, b"Height").unwrap_or(0) as u32;
+    if w < 16 || h < 16 {
       continue;
     }
 
-    let bpc = dict_int(&stream.dict, b"BitsPerComponent").unwrap_or(8);
-    if bpc != 8 {
-      continue;
-    }
+    let original_stream_len = stream.content.len();
 
-    // After decompress(), content is raw pixel data.
-    // Determine colour components from data size.
-    let pixel_count = (w as usize) * (h as usize);
-    let data_len = stream.content.len();
-    let components = if data_len == pixel_count {
-      1 // Grayscale
-    } else if data_len == pixel_count * 3 {
-      3 // RGB
-    } else if data_len == pixel_count * 4 {
-      4 // CMYK
-    } else {
-      continue; // Unknown layout, skip
+    // Determine the filter chain
+    let filter = stream.dict.get(b"Filter").ok();
+    let filter_name: Option<&[u8]> = match filter {
+      Some(Object::Name(n)) => Some(n.as_slice()),
+      _ => None,
     };
 
-    // Build raw image from pixels
-    let img: DynamicImage = match components {
-      1 => match image::GrayImage::from_raw(w, h, stream.content.clone()) {
-        Some(g) => DynamicImage::ImageLuma8(g),
-        None => continue,
-      },
-      3 => match image::RgbImage::from_raw(w, h, stream.content.clone()) {
-        Some(rgb) => DynamicImage::ImageRgb8(rgb),
-        None => continue,
-      },
-      4 => {
-        let rgb_data = cmyk_to_rgb(&stream.content);
-        match image::RgbImage::from_raw(w, h, rgb_data) {
-          Some(rgb) => DynamicImage::ImageRgb8(rgb),
-          None => continue,
+    match filter_name {
+      Some(b"DCTDecode") => {
+        // Stream content is raw JPEG bytes — decode directly
+        let img = match image::load_from_memory(&stream.content) {
+          Ok(img) => img,
+          Err(_) => continue,
+        };
+        let (components, pixels) = img_to_rgb_pixels(&img);
+        tasks.push(ImgTask { id, pixels, w: img.width(), h: img.height(), components, original_stream_len });
+      }
+      Some(b"FlateDecode") => {
+        // Stream content is zlib-compressed raw pixels
+        let mut raw = Vec::new();
+        if ZlibDecoder::new(stream.content.as_slice()).read_to_end(&mut raw).is_err() || raw.is_empty() {
+          continue;
         }
+
+        let bpc = dint(&stream.dict, b"BitsPerComponent").unwrap_or(8);
+        if bpc != 8 {
+          continue;
+        }
+
+        // Detect if PNG prediction filters were applied (predictor 10-15)
+        let dp = stream.dict.get(b"DecodeParms").ok();
+        let predictor = match dp {
+          Some(Object::Dictionary(d)) => dint(d, b"Predictor").unwrap_or(1),
+          _ => 1,
+        };
+
+        // Get component count from DecodeParms.Colors, or infer from data size
+        let dp_colors = match dp {
+          Some(Object::Dictionary(d)) => dint(d, b"Colors").map(|c| c as usize),
+          _ => None,
+        };
+
+        let pixel_count = (w as usize) * (h as usize);
+        let components = if let Some(c) = dp_colors {
+          c
+        } else {
+          // Infer from raw data length
+          let len = raw.len();
+          if predictor >= 10 {
+            // With PNG predictor: each row has 1 extra byte
+            let rows = h as usize;
+            let row_payload = if rows > 0 { (len / rows).saturating_sub(1) } else { 0 };
+            let per_pixel = if w > 0 { row_payload / (w as usize) } else { 0 };
+            if per_pixel >= 1 && per_pixel <= 4 { per_pixel } else { continue; }
+          } else if len == pixel_count { 1 }
+          else if len == pixel_count * 3 { 3 }
+          else if len == pixel_count * 4 { 4 }
+          else { continue; }
+        };
+
+        // Undo PNG prediction if needed
+        let pixels = if predictor >= 10 {
+          match undo_png_predict(&raw, w as usize, h as usize, components) {
+            Some(p) => p,
+            None => continue,
+          }
+        } else {
+          raw
+        };
+
+        // Validate data size
+        if pixels.len() != pixel_count * components {
+          continue;
+        }
+
+        tasks.push(ImgTask { id, pixels, w, h, components, original_stream_len });
       }
       _ => continue,
-    };
-
-    // Encode to JPEG to get baseline bytes for comparison
-    let mut buf = Cursor::new(Vec::new());
-    JpegEncoder::new_with_quality(&mut buf, quality)
-      .encode_image(&img)
-      .ok();
-    let jpeg_bytes = buf.into_inner();
-    if jpeg_bytes.is_empty() {
-      continue;
     }
-
-    tasks.push(ImageTask {
-      id,
-      jpeg_bytes,
-      original_len: data_len,
-      width: w,
-      height: h,
-    });
   }
 
   let total = tasks.len();
   if total == 0 {
+    emit(app, path, "没有可压缩的图片", 2, 4);
     return Ok(());
   }
 
-  emit(app, path, &format!("处理 {total} 张图片"), 2, 4);
+  emit(app, path, &format!("压缩 {total} 张图片"), 2, 4);
 
-  // Phase 2: Parallel resize + re-encode
   let done = Arc::new(AtomicUsize::new(0));
   let app2 = app.clone();
-  let path_str = path.to_string_lossy().to_string();
+  let path_s = path.to_string_lossy().to_string();
 
-  struct CompressedImage {
+  struct Result {
     id: ObjectId,
-    data: Vec<u8>,
+    jpeg: Vec<u8>,
     new_w: u32,
     new_h: u32,
   }
 
-  let results: Vec<CompressedImage> = tasks
+  let results: Vec<Result> = tasks
     .into_par_iter()
     .filter_map(|task| {
-      // Decode the baseline JPEG we just encoded
-      let img = image::load_from_memory(&task.jpeg_bytes).ok()?;
+      // Build DynamicImage from raw pixels
+      let img: DynamicImage = match task.components {
+        1 => {
+          let g = image::GrayImage::from_raw(task.w, task.h, task.pixels)?;
+          DynamicImage::ImageLuma8(g).into_rgb8().into()
+        }
+        3 => {
+          let rgb = image::RgbImage::from_raw(task.w, task.h, task.pixels)?;
+          DynamicImage::ImageRgb8(rgb)
+        }
+        4 => {
+          let rgb_data = cmyk_to_rgb(&task.pixels);
+          let rgb = image::RgbImage::from_raw(task.w, task.h, rgb_data)?;
+          DynamicImage::ImageRgb8(rgb)
+        }
+        _ => return None,
+      };
 
       // Resize if needed
-      let img = if let Some(limit) = max_dim {
-        if task.width > limit || task.height > limit {
+      let img = match max_dim {
+        Some(limit) if img.width() > limit || img.height() > limit => {
           img.resize(limit, limit, FilterType::Lanczos3)
-        } else {
-          img
         }
-      } else {
-        img
+        _ => img,
       };
 
       let new_w = img.width();
       let new_h = img.height();
 
-      // Re-encode at target quality (if resized, this will be smaller)
-      let mut out = Cursor::new(Vec::new());
-      JpegEncoder::new_with_quality(&mut out, quality)
-        .encode_image(&img)
-        .ok()?;
-      let data = out.into_inner();
+      // Encode to JPEG
+      let mut buf = Cursor::new(Vec::new());
+      JpegEncoder::new_with_quality(&mut buf, quality).encode_image(&img).ok()?;
+      let jpeg = buf.into_inner();
 
-      // Only keep if smaller than original stream
-      if data.len() >= task.original_len {
-        // Track progress even for skipped images
-        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 5 == 0 || n == total {
-          let _ = app2.emit(
-            "compress-progress",
-            ProgressEvent {
-              path: path_str.clone(),
-              stage: format!("图片 {n}/{total}"),
-              completed: 2,
-              total: 4,
-            },
-          );
-        }
+      // Progress
+      let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+      if n % 5 == 0 || n == total {
+        let _ = app2.emit("compress-progress", ProgressEvent {
+          path: path_s.clone(),
+          stage: format!("图片 {n}/{total}"),
+          completed: 2, total: 4,
+        });
+      }
+
+      // Only keep if actually smaller
+      if jpeg.len() >= task.original_stream_len {
         return None;
       }
 
-      let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-      if n % 5 == 0 || n == total {
-        let _ = app2.emit(
-          "compress-progress",
-          ProgressEvent {
-            path: path_str.clone(),
-            stage: format!("图片 {n}/{total}"),
-            completed: 2,
-            total: 4,
-          },
-        );
-      }
-
-      Some(CompressedImage {
-        id: task.id,
-        data,
-        new_w,
-        new_h,
-      })
+      Some(Result { id: task.id, jpeg, new_w, new_h })
     })
     .collect();
 
-  // Phase 3: Write results back
-  for result in results {
-    if let Some(Object::Stream(stream)) = doc.objects.get_mut(&result.id) {
-      stream.content = result.data;
+  // Phase 3: Write back
+  for r in results {
+    if let Some(Object::Stream(stream)) = doc.objects.get_mut(&r.id) {
+      stream.content = r.jpeg;
       stream.dict.remove(b"Filter");
       stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
       stream.dict.set("Length", Object::Integer(stream.content.len() as i64));
       stream.dict.remove(b"DecodeParms");
-      // Update dimensions if resized
-      stream.dict.set("Width", Object::Integer(result.new_w as i64));
-      stream.dict.set("Height", Object::Integer(result.new_h as i64));
-      // Remove colour space — DCTDecode JPEG carries its own
+      stream.dict.set("Width", Object::Integer(r.new_w as i64));
+      stream.dict.set("Height", Object::Integer(r.new_h as i64));
       stream.dict.remove(b"ColorSpace");
       stream.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
       stream.dict.set("BitsPerComponent", Object::Integer(8));
@@ -380,57 +380,68 @@ fn recompress_images(
   Ok(())
 }
 
-// ─── Cleanup helpers ───────────────────────────────────────────────
+fn img_to_rgb_pixels(img: &DynamicImage) -> (usize, Vec<u8>) {
+  let rgb = img.to_rgb8();
+  (3, rgb.into_raw())
+}
 
-fn strip_interactive(doc: &mut Document, remove_annots: bool) {
-  doc.trailer.remove(b"Info");
-  if let Some(root_id) = catalog_id(doc) {
-    if let Some(Object::Dictionary(root)) = doc.objects.get_mut(&root_id) {
-      root.remove(b"Outlines");
-      root.remove(b"AcroForm");
-      root.remove(b"Names");
-    }
+// ─── PNG prediction reversal ───────────────────────────────────────
+
+fn undo_png_predict(data: &[u8], w: usize, h: usize, components: usize) -> Option<Vec<u8>> {
+  let stride = w * components;
+  let row_bytes = stride + 1;
+  if data.len() < row_bytes * h {
+    return None;
   }
-  if remove_annots {
-    let page_ids: Vec<ObjectId> = doc.get_pages().values().copied().collect();
-    for pid in page_ids {
-      if let Some(Object::Dictionary(page)) = doc.objects.get_mut(&pid) {
-        page.remove(b"Annots");
+
+  let mut out = Vec::with_capacity(stride * h);
+  let mut prev = vec![0u8; stride];
+
+  for row in 0..h {
+    let off = row * row_bytes;
+    let ft = data[off];
+    let src = &data[off + 1..off + row_bytes];
+    let mut cur = src.to_vec();
+
+    match ft {
+      0 => {}
+      1 => { for i in components..stride { cur[i] = cur[i].wrapping_add(cur[i - components]); } }
+      2 => { for i in 0..stride { cur[i] = cur[i].wrapping_add(prev[i]); } }
+      3 => {
+        for i in 0..stride {
+          let a = if i >= components { cur[i - components] as u16 } else { 0 };
+          let b = prev[i] as u16;
+          cur[i] = cur[i].wrapping_add(((a + b) / 2) as u8);
+        }
       }
+      4 => {
+        for i in 0..stride {
+          let a = if i >= components { cur[i - components] } else { 0 };
+          let b = prev[i];
+          let c = if i >= components { prev[i - components] } else { 0 };
+          cur[i] = cur[i].wrapping_add(paeth(a, b, c));
+        }
+      }
+      _ => return None,
     }
+
+    out.extend_from_slice(&cur);
+    prev = cur;
   }
+  Some(out)
 }
 
-fn strip_metadata(doc: &mut Document) {
-  if let Some(root_id) = catalog_id(doc) {
-    if let Some(Object::Dictionary(root)) = doc.objects.get_mut(&root_id) {
-      root.remove(b"Metadata");
-      root.remove(b"Lang");
-      root.remove(b"PageLabels");
-      root.remove(b"StructTreeRoot");
-      root.remove(b"MarkInfo");
-    }
-  }
-}
-
-// ─── Utilities ─────────────────────────────────────────────────────
-
-fn is_image_stream(stream: &Stream) -> bool {
-  matches!(
-    stream.dict.get(b"Subtype"),
-    Ok(Object::Name(ref name)) if name.as_slice() == b"Image"
-  )
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+  let (a, b, c) = (a as i32, b as i32, c as i32);
+  let p = a + b - c;
+  let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+  if pa <= pb && pa <= pc { a as u8 } else if pb <= pc { b as u8 } else { c as u8 }
 }
 
 fn cmyk_to_rgb(cmyk: &[u8]) -> Vec<u8> {
   let mut rgb = Vec::with_capacity(cmyk.len() / 4 * 3);
-  for chunk in cmyk.chunks_exact(4) {
-    let (c, m, y, k) = (
-      chunk[0] as f32 / 255.0,
-      chunk[1] as f32 / 255.0,
-      chunk[2] as f32 / 255.0,
-      chunk[3] as f32 / 255.0,
-    );
+  for ch in cmyk.chunks_exact(4) {
+    let (c, m, y, k) = (ch[0] as f32 / 255.0, ch[1] as f32 / 255.0, ch[2] as f32 / 255.0, ch[3] as f32 / 255.0);
     rgb.push(((1.0 - c) * (1.0 - k) * 255.0) as u8);
     rgb.push(((1.0 - m) * (1.0 - k) * 255.0) as u8);
     rgb.push(((1.0 - y) * (1.0 - k) * 255.0) as u8);
@@ -438,35 +449,68 @@ fn cmyk_to_rgb(cmyk: &[u8]) -> Vec<u8> {
   rgb
 }
 
-fn output_path_for(path: &Path) -> PathBuf {
-  let parent = path.parent().unwrap_or_else(|| Path::new("."));
-  let stem = path
-    .file_stem()
-    .and_then(|v| v.to_str())
-    .unwrap_or("document");
+// ─── Cleanup ───────────────────────────────────────────────────────
+
+fn strip_interactive(doc: &mut Document, annots: bool) {
+  doc.trailer.remove(b"Info");
+  if let Some(rid) = cat_id(doc) {
+    if let Some(Object::Dictionary(r)) = doc.objects.get_mut(&rid) {
+      r.remove(b"Outlines");
+      r.remove(b"AcroForm");
+      r.remove(b"Names");
+    }
+  }
+  if annots {
+    let pids: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+    for pid in pids {
+      if let Some(Object::Dictionary(p)) = doc.objects.get_mut(&pid) {
+        p.remove(b"Annots");
+      }
+    }
+  }
+}
+
+fn strip_metadata(doc: &mut Document) {
+  if let Some(rid) = cat_id(doc) {
+    if let Some(Object::Dictionary(r)) = doc.objects.get_mut(&rid) {
+      r.remove(b"Metadata");
+      r.remove(b"Lang");
+      r.remove(b"PageLabels");
+      r.remove(b"StructTreeRoot");
+      r.remove(b"MarkInfo");
+    }
+  }
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────
+
+fn is_image(s: &Stream) -> bool {
+  matches!(s.dict.get(b"Subtype"), Ok(Object::Name(ref n)) if n.as_slice() == b"Image")
+}
+
+fn output_path_for(p: &Path) -> PathBuf {
+  let parent = p.parent().unwrap_or_else(|| Path::new("."));
+  let stem = p.file_stem().and_then(|v| v.to_str()).unwrap_or("doc");
   parent.join(format!("{stem}_compressed.pdf"))
 }
 
-fn emit(app: &AppHandle, path: &Path, stage: &str, completed: usize, total: usize) {
-  let _ = app.emit(
-    "compress-progress",
-    ProgressEvent {
-      path: path.to_string_lossy().to_string(),
-      stage: stage.to_string(),
-      completed,
-      total,
-    },
-  );
+fn emit(app: &AppHandle, path: &Path, stage: &str, done: usize, total: usize) {
+  let _ = app.emit("compress-progress", ProgressEvent {
+    path: path.to_string_lossy().to_string(),
+    stage: stage.to_string(),
+    completed: done,
+    total,
+  });
 }
 
-fn catalog_id(doc: &Document) -> Option<ObjectId> {
+fn cat_id(doc: &Document) -> Option<ObjectId> {
   match doc.trailer.get(b"Root") {
     Ok(Object::Reference(id)) => Some(*id),
     _ => None,
   }
 }
 
-fn info_dictionary<'a>(doc: &'a Document) -> Option<&'a lopdf::Dictionary> {
+fn info_dict<'a>(doc: &'a Document) -> Option<&'a lopdf::Dictionary> {
   let id = match doc.trailer.get(b"Info") {
     Ok(Object::Reference(id)) => *id,
     _ => return None,
@@ -478,16 +522,15 @@ fn info_dictionary<'a>(doc: &'a Document) -> Option<&'a lopdf::Dictionary> {
   }
 }
 
-fn dict_string(dict: &lopdf::Dictionary, key: &[u8]) -> Option<String> {
-  match dict.get(key).ok()? {
-    Object::String(b, _) => Some(String::from_utf8_lossy(b).to_string()),
-    Object::Name(b) => Some(String::from_utf8_lossy(b).to_string()),
+fn dstr(d: &lopdf::Dictionary, k: &[u8]) -> Option<String> {
+  match d.get(k).ok()? {
+    Object::String(b, _) | Object::Name(b) => Some(String::from_utf8_lossy(b).to_string()),
     _ => None,
   }
 }
 
-fn dict_int(dict: &lopdf::Dictionary, key: &[u8]) -> Option<i64> {
-  match dict.get(key).ok()? {
+fn dint(d: &lopdf::Dictionary, k: &[u8]) -> Option<i64> {
+  match d.get(k).ok()? {
     Object::Integer(i) => Some(*i),
     _ => None,
   }
