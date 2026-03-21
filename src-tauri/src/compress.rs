@@ -6,6 +6,9 @@ use std::{
   time::Instant,
 };
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use flate2::read::ZlibDecoder;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage};
 use lopdf::{Document, Object, ObjectId, Stream};
@@ -180,7 +183,11 @@ fn find_ghostscript(app: &AppHandle) -> Option<PathBuf> {
 
   // 2. Check PATH
   for name in &["gswin64c", "gswin32c", "gs"] {
-    if Command::new(name).arg("--version").output().is_ok() {
+    let mut probe = Command::new(name);
+    probe.arg("--version");
+    #[cfg(target_os = "windows")]
+    { const CREATE_NO_WINDOW: u32 = 0x08000000; probe.creation_flags(CREATE_NO_WINDOW); }
+    if probe.output().is_ok() {
       return Some(PathBuf::from(name));
     }
   }
@@ -233,7 +240,9 @@ fn compress_with_gs(
 
   let mut cmd = Command::new(gs_path);
 
-  // Set working dir to the GS bin directory so it can find gsdll*.dll and lib/
+  #[cfg(target_os = "windows")]
+  { const CREATE_NO_WINDOW: u32 = 0x08000000; cmd.creation_flags(CREATE_NO_WINDOW); }
+
   if let Some(bin_dir) = gs_path.parent() {
     cmd.current_dir(bin_dir);
     // Point GS to sibling lib/ directory for PostScript resources
