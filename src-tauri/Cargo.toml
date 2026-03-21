@@ -16,5 +16,4 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 lopdf = "0.34"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
-flate2 = "1"
 rayon = "1"
