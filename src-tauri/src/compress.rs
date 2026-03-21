@@ -5,7 +5,7 @@ use std::{
   time::Instant,
 };
 
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ImageEncoder};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
 use lopdf::{Document, Object, ObjectId, Stream};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
