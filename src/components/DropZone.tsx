@@ -12,15 +12,12 @@ export default function DropZone({ active, onDragOver, onDragLeave, onDrop, chil
   return (
     <div
       className="drop-zone"
-      onDragOver={(event) => {
-        event.preventDefault();
-        onDragOver();
-      }}
+      onDragOver={(e) => { e.preventDefault(); onDragOver(); }}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
       {children}
-      {active ? <div className="drop-overlay">释放以添加 PDF 文件</div> : null}
+      {active && <div className="drop-overlay">松开鼠标以添加 PDF</div>}
     </div>
   );
 }

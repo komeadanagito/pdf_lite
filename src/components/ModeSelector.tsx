@@ -6,25 +6,25 @@ interface ModeSelectorProps {
   descriptions: Record<CompressionMode, string>;
 }
 
-const options: Array<{ value: CompressionMode; label: string }> = [
-  { value: 0, label: '无损' },
-  { value: 1, label: '轻度' },
-  { value: 2, label: '标准' },
-  { value: 3, label: '极限' }
+const options: Array<{ value: CompressionMode; label: string; short: string }> = [
+  { value: 0, label: '无损', short: '仅结构优化' },
+  { value: 1, label: '轻度', short: '图片轻压缩' },
+  { value: 2, label: '标准', short: '删除冗余内容' },
+  { value: 3, label: '极限', short: '最大压缩率' }
 ];
 
-export default function ModeSelector({ mode, onChange, descriptions }: ModeSelectorProps) {
+export default function ModeSelector({ mode, onChange }: ModeSelectorProps) {
   return (
     <div className="mode-selector">
-      {options.map((option) => (
+      {options.map((opt) => (
         <button
-          key={option.value}
-          className={`mode-button ${mode === option.value ? 'active' : ''}`}
+          key={opt.value}
+          className={`mode-btn${mode === opt.value ? ' active' : ''}`}
           type="button"
-          onClick={() => onChange(option.value)}
+          onClick={() => onChange(opt.value)}
         >
-          <strong>{option.label}</strong>
-          <span>{descriptions[option.value]}</span>
+          <strong>{opt.label}</strong>
+          <span>{opt.short}</span>
         </button>
       ))}
     </div>

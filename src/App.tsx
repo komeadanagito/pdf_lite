@@ -58,11 +58,11 @@ const modeDescriptions: Record<CompressionMode, string> = {
   0: '无损：结构优化与流重压缩',
   1: '轻度：无损 + JPEG 重压缩',
   2: '标准：轻度 + 删除书签/注释/表单',
-  3: '极限：标准 + 去元数据 + 更激进图片处理'
+  3: '极限：标准 + 去元数据 + 更激进图片压缩'
 };
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes)) return '-';
+  if (!Number.isFinite(bytes) || bytes === 0) return '-';
   const units = ['B', 'KB', 'MB', 'GB'];
   let value = bytes;
   let unit = 0;
@@ -75,8 +75,8 @@ function formatBytes(bytes: number): string {
 
 function formatRatio(original: number, compressed?: number): string {
   if (!compressed || original <= 0) return '-';
-  const ratio = (1 - compressed / original) * 100;
-  return `${ratio >= 0 ? '+' : ''}${ratio.toFixed(1)}%`;
+  const saved = (1 - compressed / original) * 100;
+  return saved >= 0 ? `↓ ${saved.toFixed(1)}%` : `↑ ${Math.abs(saved).toFixed(1)}%`;
 }
 
 function createFileItem(path: string, info: PdfInfo): PdfFileItem {
@@ -106,50 +106,32 @@ export default function App() {
       unlisten = cleanup;
     });
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
+      if (unlisten) unlisten();
     };
   }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-
     getCurrentWebview()
       .onDragDropEvent((event) => {
-        const payload = event.payload as {
-          type: string;
-          paths: string[];
-        };
-
-        if (payload.type === 'enter' || payload.type === 'over') {
-          setDragActive(true);
-        }
-
-        if (payload.type !== 'enter' && payload.type !== 'over') {
-          setDragActive(false);
-        }
-
+        const payload = event.payload as { type: string; paths: string[] };
+        if (payload.type === 'enter' || payload.type === 'over') setDragActive(true);
+        if (payload.type !== 'enter' && payload.type !== 'over') setDragActive(false);
         if (payload.type === 'drop') {
           setDragActive(false);
-          void addFiles(payload.paths.filter((path) => path.toLowerCase().endsWith('.pdf')));
+          void addFiles(payload.paths.filter((p) => p.toLowerCase().endsWith('.pdf')));
         }
       })
-      .then((cleanup) => {
-        unlisten = cleanup;
-      });
-
+      .then((cleanup) => { unlisten = cleanup; });
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
+      if (unlisten) unlisten();
     };
   }, []);
 
-  const selectedCount = useMemo(() => files.filter((file) => file.selected).length, [files]);
+  const selectedCount = useMemo(() => files.filter((f) => f.selected).length, [files]);
   const totals = useMemo(() => {
-    const original = files.reduce((sum, file) => sum + file.size, 0);
-    const compressed = files.reduce((sum, file) => sum + (file.compressedSize ?? 0), 0);
+    const original = files.reduce((s, f) => s + f.size, 0);
+    const compressed = files.reduce((s, f) => s + (f.compressedSize ?? 0), 0);
     return { original, compressed };
   }, [files]);
 
@@ -171,7 +153,7 @@ export default function App() {
     if (busy || files.length === 0) return;
     setBusy(true);
     try {
-      const targets = files.filter((file) => file.status !== 'compressing');
+      const targets = files.filter((f) => f.status !== 'compressing');
       for (const item of targets) {
         dispatch({ type: 'set_status', id: item.id, status: 'compressing' });
         try {
@@ -184,6 +166,7 @@ export default function App() {
       }
     } finally {
       setBusy(false);
+      setProgress(null);
     }
   }
 
@@ -195,15 +178,34 @@ export default function App() {
   return (
     <DropZone active={dragActive} onDragOver={() => setDragActive(true)} onDragLeave={() => setDragActive(false)} onDrop={handleDrop}>
       <div className="app-shell">
+
         <header className="app-header">
-          <div>
-            <p className="eyebrow">PDF Lite</p>
-            <h1>PDF 压缩工作台</h1>
+          <div className="header-left">
+            <div className="app-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+                <line x1="9" y1="15" x2="15" y2="15" />
+              </svg>
+            </div>
+            <div>
+              <div className="app-title">PDF Lite</div>
+              <div className="app-subtitle">
+                {progress
+                  ? `${progress.stage}… ${progress.completed}/${progress.total}`
+                  : '点击添加或拖入 PDF 文件'}
+              </div>
+            </div>
           </div>
           <div className="header-stats">
-            <span>{files.length} 个文件</span>
-            <span>{selectedCount} 个已选</span>
-            <span>{progress ? `${progress.stage} ${progress.completed}/${progress.total}` : '待命'}</span>
+            <div className="stat-item">
+              <div className="stat-value">{files.length}</div>
+              <div className="stat-label">文件数</div>
+            </div>
+            <div className="stat-item">
+              <div className="stat-value">{selectedCount}</div>
+              <div className="stat-label">已选</div>
+            </div>
           </div>
         </header>
 
@@ -226,24 +228,23 @@ export default function App() {
         <footer className="bottom-bar">
           <ModeSelector mode={mode} onChange={setMode} descriptions={modeDescriptions} />
           <div className="summary">
-            <div>
-              <span>原始体积</span>
-              <strong>{formatBytes(totals.original)}</strong>
+            <div className="summary-item">
+              <div className="s-label">原始大小</div>
+              <div className="s-value">{formatBytes(totals.original)}</div>
             </div>
-            <div>
-              <span>压缩后体积</span>
-              <strong>{formatBytes(totals.compressed)}</strong>
+            <div className="summary-item">
+              <div className="s-label">压缩后</div>
+              <div className="s-value">{formatBytes(totals.compressed)}</div>
             </div>
-            <div>
-              <span>压缩率</span>
-              <strong>{formatRatio(totals.original, totals.compressed)}</strong>
+            <div className="summary-item">
+              <div className="s-label">节省</div>
+              <div className="s-value">{formatRatio(totals.original, totals.compressed)}</div>
             </div>
           </div>
         </footer>
 
-        <p className="hint">
-          拖拽 PDF 到窗口，或点击“添加文件”。当前模式：{modeDescriptions[mode]}
-        </p>
+        <p className="hint">当前模式：{modeDescriptions[mode]}</p>
+
       </div>
     </DropZone>
   );

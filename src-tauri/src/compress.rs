@@ -1,12 +1,13 @@
 use std::{
   fs,
-  io::Cursor,
+  io::{Cursor, Read},
   path::{Path, PathBuf},
   time::Instant,
 };
 
+use flate2::read::ZlibDecoder;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
-use lopdf::{Document, Object, ObjectId, Stream};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
@@ -168,8 +169,11 @@ fn recompress_images(doc: &mut Document, quality: u8, max_dimension: Option<u32>
     .collect();
 
   for id in image_ids {
+    // Resolve ICCBased component count before mutably borrowing the stream
+    let icc_components = resolve_icc_components(doc, id);
+
     if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
-      if let Some(new_bytes) = recompress_image_stream(stream, quality, max_dimension) {
+      if let Some(new_bytes) = recompress_image_stream(stream, quality, max_dimension, icc_components) {
         stream.content = new_bytes;
         stream.dict.remove(b"Filter");
         stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
@@ -182,12 +186,63 @@ fn recompress_images(doc: &mut Document, quality: u8, max_dimension: Option<u32>
   Ok(())
 }
 
-fn recompress_image_stream(stream: &mut Stream, quality: u8, max_dimension: Option<u32>) -> Option<Vec<u8>> {
-  let image = image::load_from_memory(&stream.content).ok()?;
-  let image = if let Some(max_dimension) = max_dimension {
-    let (width, height) = (image.width(), image.height());
-    if width > max_dimension || height > max_dimension {
-      image.resize(max_dimension, max_dimension, FilterType::Lanczos3)
+/// Resolve the component count for an ICCBased color space by following the reference.
+fn resolve_icc_components(doc: &Document, image_id: ObjectId) -> Option<usize> {
+  let stream = match doc.objects.get(&image_id) {
+    Some(Object::Stream(s)) => s,
+    _ => return None,
+  };
+
+  let cs = stream.dict.get(b"ColorSpace").ok()?;
+  let arr = match cs {
+    Object::Array(a) => a,
+    _ => return None,
+  };
+
+  match arr.first() {
+    Some(Object::Name(name)) if name.as_slice() == b"ICCBased" => {}
+    _ => return None,
+  }
+
+  let ref_id = match arr.get(1) {
+    Some(Object::Reference(id)) => *id,
+    _ => return None,
+  };
+
+  match doc.objects.get(&ref_id) {
+    Some(Object::Stream(icc_stream)) => dict_integer(&icc_stream.dict, b"N").map(|n| n as usize),
+    _ => None,
+  }
+}
+
+fn recompress_image_stream(stream: &mut Stream, quality: u8, max_dimension: Option<u32>, icc_components: Option<usize>) -> Option<Vec<u8>> {
+  // Determine current filter - only handle Name filters (not arrays of filters)
+  let filter_name = match stream.dict.get(b"Filter").ok()? {
+    Object::Name(name) => name.clone(),
+    _ => return None,
+  };
+
+  let image = match filter_name.as_slice() {
+    b"DCTDecode" => {
+      // Content is raw JPEG bytes - can decode directly
+      image::load_from_memory(&stream.content).ok()?
+    }
+    b"FlateDecode" => {
+      // Content is zlib-compressed raw pixel data - need full decode pipeline
+      decode_flate_image(stream, icc_components)?
+    }
+    _ => return None,
+  };
+
+  // Skip tiny images - recompressing them as JPEG can increase size
+  if image.width() < 16 || image.height() < 16 {
+    return None;
+  }
+
+  let image = if let Some(max_dim) = max_dimension {
+    let (w, h) = (image.width(), image.height());
+    if w > max_dim || h > max_dim {
+      image.resize(max_dim, max_dim, FilterType::Lanczos3)
     } else {
       image
     }
@@ -198,7 +253,218 @@ fn recompress_image_stream(stream: &mut Stream, quality: u8, max_dimension: Opti
   let mut output = Cursor::new(Vec::new());
   let mut encoder = JpegEncoder::new_with_quality(&mut output, quality);
   encoder.encode_image(&image).ok()?;
-  Some(output.into_inner())
+
+  // Only use recompressed version if it is actually smaller
+  let new_bytes = output.into_inner();
+  if new_bytes.len() >= stream.content.len() {
+    return None;
+  }
+  Some(new_bytes)
+}
+
+/// Decode a FlateDecode image stream into a DynamicImage.
+fn decode_flate_image(stream: &Stream, icc_components: Option<usize>) -> Option<image::DynamicImage> {
+  // Decompress zlib data
+  let mut decoder = ZlibDecoder::new(stream.content.as_slice());
+  let mut raw = Vec::new();
+  decoder.read_to_end(&mut raw).ok()?;
+
+  let width = dict_integer(&stream.dict, b"Width")? as usize;
+  let height = dict_integer(&stream.dict, b"Height")? as usize;
+  let bits = dict_integer(&stream.dict, b"BitsPerComponent").unwrap_or(8);
+  if bits != 8 {
+    return None;
+  }
+
+  // Use directly-known color space, pre-resolved ICCBased count, or infer from data size
+  let components = color_space_components(&stream.dict)
+    .or(icc_components)
+    .or_else(|| infer_components_from_size(&raw, width, height, stream));
+
+  // Undo PNG prediction filter if present (Predictor 10-15)
+  let components = components?;
+
+  let predictor = stream
+    .dict
+    .get(b"DecodeParms")
+    .ok()
+    .and_then(|p| match p {
+      Object::Dictionary(d) => dict_integer(d, b"Predictor"),
+      _ => None,
+    })
+    .unwrap_or(1);
+
+  let pixels = if predictor >= 10 {
+    undo_png_prediction(&raw, width, height, components)?
+  } else {
+    raw
+  };
+
+  match components {
+    1 => {
+      let img = image::GrayImage::from_raw(width as u32, height as u32, pixels)?;
+      Some(image::DynamicImage::ImageLuma8(img))
+    }
+    3 => {
+      let img = image::RgbImage::from_raw(width as u32, height as u32, pixels)?;
+      Some(image::DynamicImage::ImageRgb8(img))
+    }
+    4 => {
+      // CMYK → convert to RGB before re-encoding as JPEG
+      let rgb = cmyk_to_rgb(&pixels);
+      let img = image::RgbImage::from_raw(width as u32, height as u32, rgb)?;
+      Some(image::DynamicImage::ImageRgb8(img))
+    }
+    _ => None,
+  }
+}
+
+/// Reverse the per-row PNG prediction filtering applied by many PDF writers.
+fn undo_png_prediction(data: &[u8], width: usize, height: usize, components: usize) -> Option<Vec<u8>> {
+  let stride = width * components;
+  let row_size = stride + 1; // first byte of each row is the filter type
+
+  if data.len() < row_size * height {
+    return None;
+  }
+
+  let mut result = Vec::with_capacity(stride * height);
+  let mut prev = vec![0u8; stride];
+
+  for row in 0..height {
+    let base = row * row_size;
+    let filter_type = data[base];
+    let src = &data[base + 1..base + row_size];
+    let mut cur = src.to_vec();
+
+    match filter_type {
+      0 => {} // None
+      1 => {
+        // Sub
+        for i in components..stride {
+          cur[i] = cur[i].wrapping_add(cur[i - components]);
+        }
+      }
+      2 => {
+        // Up
+        for i in 0..stride {
+          cur[i] = cur[i].wrapping_add(prev[i]);
+        }
+      }
+      3 => {
+        // Average
+        for i in 0..stride {
+          let a = if i >= components { cur[i - components] as u16 } else { 0 };
+          let b = prev[i] as u16;
+          cur[i] = cur[i].wrapping_add(((a + b) / 2) as u8);
+        }
+      }
+      4 => {
+        // Paeth
+        for i in 0..stride {
+          let a = if i >= components { cur[i - components] } else { 0 };
+          let b = prev[i];
+          let c = if i >= components { prev[i - components] } else { 0 };
+          cur[i] = cur[i].wrapping_add(paeth(a, b, c));
+        }
+      }
+      _ => return None,
+    }
+
+    result.extend_from_slice(&cur);
+    prev = cur;
+  }
+
+  Some(result)
+}
+
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+  let (a, b, c) = (a as i32, b as i32, c as i32);
+  let p = a + b - c;
+  let pa = (p - a).abs();
+  let pb = (p - b).abs();
+  let pc = (p - c).abs();
+  if pa <= pb && pa <= pc {
+    a as u8
+  } else if pb <= pc {
+    b as u8
+  } else {
+    c as u8
+  }
+}
+
+fn color_space_components(dict: &Dictionary) -> Option<usize> {
+  let cs = dict.get(b"ColorSpace").ok()?;
+  match cs {
+    Object::Name(name) => match name.as_slice() {
+      b"DeviceGray" | b"CalGray" => Some(1),
+      b"DeviceRGB" | b"CalRGB" => Some(3),
+      b"DeviceCMYK" => Some(4),
+      _ => None,
+    },
+    Object::Array(arr) => match arr.first() {
+      Some(Object::Name(name)) => match name.as_slice() {
+        b"ICCBased" => None, // Resolved separately via resolve_icc_components
+        b"CalRGB" => Some(3),
+        b"CalGray" => Some(1),
+        _ => None,
+      },
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+/// Infer component count from decompressed data size when color space is unresolvable.
+fn infer_components_from_size(raw: &[u8], width: usize, height: usize, stream: &Stream) -> Option<usize> {
+  if width == 0 || height == 0 {
+    return None;
+  }
+  let has_predictor = stream
+    .dict
+    .get(b"DecodeParms")
+    .ok()
+    .and_then(|p| match p {
+      Object::Dictionary(d) => dict_integer(d, b"Predictor"),
+      _ => None,
+    })
+    .map(|p| p >= 10)
+    .unwrap_or(false);
+
+  // With PNG predictor: each row has an extra filter-type byte
+  let pixels_per_row = width;
+  for &n in &[1usize, 3, 4] {
+    let expected = if has_predictor {
+      height * (pixels_per_row * n + 1)
+    } else {
+      height * pixels_per_row * n
+    };
+    if raw.len() == expected {
+      return Some(n);
+    }
+  }
+  None
+}
+
+fn dict_integer(dict: &Dictionary, key: &[u8]) -> Option<i64> {
+  match dict.get(key).ok()? {
+    Object::Integer(i) => Some(*i),
+    _ => None,
+  }
+}
+
+fn cmyk_to_rgb(cmyk: &[u8]) -> Vec<u8> {
+  let mut rgb = Vec::with_capacity(cmyk.len() / 4 * 3);
+  for chunk in cmyk.chunks_exact(4) {
+    let c = chunk[0] as f32 / 255.0;
+    let m = chunk[1] as f32 / 255.0;
+    let y = chunk[2] as f32 / 255.0;
+    let k = chunk[3] as f32 / 255.0;
+    rgb.push(((1.0 - c) * (1.0 - k) * 255.0) as u8);
+    rgb.push(((1.0 - m) * (1.0 - k) * 255.0) as u8);
+    rgb.push(((1.0 - y) * (1.0 - k) * 255.0) as u8);
+  }
+  rgb
 }
 
 fn strip_interactive_content(doc: &mut Document, remove_annotations: bool) {
