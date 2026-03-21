@@ -4,3 +4,19 @@ src-tauri/target
 src-tauri/gen
 .DS_Store
 *.log
+
+# Local environment
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# TypeScript / Vite generated files
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db

@@ -25,7 +25,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi", "appimage", "deb", "dmg"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    },
+    "targets": ["nsis", "appimage", "deb", "dmg"],
     "icon": []
   }
 }
