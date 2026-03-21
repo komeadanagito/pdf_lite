@@ -5,7 +5,8 @@ use std::{
   time::Instant,
 };
 
-use flate2::read::ZlibDecoder;
+use flate2::read::{DeflateDecoder, ZlibDecoder};
+use std::collections::HashMap;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
@@ -137,7 +138,15 @@ pub fn compress_pdf_at_path(app: &AppHandle, path: &Path, mode: CompressionMode)
   }
   document.save(&output_path).map_err(|error| error.to_string())?;
 
-  let compressed_size = fs::metadata(&output_path).map_err(|error| error.to_string())?.len();
+  let mut compressed_size = fs::metadata(&output_path).map_err(|error| error.to_string())?.len();
+
+  // If the output ended up larger than the original (e.g. due to serialisation
+  // overhead), replace it with a verbatim copy so the user never gets a bigger file.
+  if compressed_size >= original_size {
+    fs::copy(path, &output_path).map_err(|e| e.to_string())?;
+    compressed_size = original_size;
+  }
+
   let saved_bytes = original_size as i64 - compressed_size as i64;
   let compression_ratio = if original_size == 0 {
     0.0
@@ -180,6 +189,11 @@ fn recompress_images(
     })
     .collect();
 
+  // Build a global map: image ObjectId → component count.
+  // This resolves named colour spaces (e.g. /CS0) defined in page Resources,
+  // which cannot be read from the image stream dictionary alone.
+  let cs_map = build_colorspace_map(doc);
+
   let tasks: Vec<(ObjectId, Vec<u8>, Dictionary, Option<usize>)> = image_ids
     .iter()
     .filter_map(|&id| {
@@ -187,7 +201,8 @@ fn recompress_images(
         Some(Object::Stream(s)) => (s.content.clone(), s.dict.clone()),
         _ => return None,
       };
-      let icc = resolve_icc_components(doc, id);
+      // Prefer direct ICC resolution, fall back to page-resource map
+      let icc = resolve_icc_components(doc, id).or_else(|| cs_map.get(&id).copied());
       Some((id, content, dict, icc))
     })
     .collect();
@@ -239,6 +254,144 @@ fn recompress_images(
   }
 
   Ok(())
+}
+
+/// Walk every page's Resources dictionary and build a map from image XObject ObjectId
+/// to its colour-space component count.  This resolves named colour spaces such as
+/// `/CS0` or `/Cs1` that are defined in the Resources dict rather than the image stream.
+fn build_colorspace_map(doc: &Document) -> HashMap<ObjectId, usize> {
+  let mut map: HashMap<ObjectId, usize> = HashMap::new();
+
+  // Collect all page object IDs
+  let page_ids: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+  for page_id in page_ids {
+    // Get page Resources dictionary
+    let resources_obj = match doc.objects.get(&page_id) {
+      Some(Object::Dictionary(d)) => d.get(b"Resources").ok().cloned(),
+      _ => None,
+    };
+
+    let resources_dict = match resources_obj {
+      Some(Object::Dictionary(d)) => d,
+      Some(Object::Reference(id)) => match doc.objects.get(&id) {
+        Some(Object::Dictionary(d)) => d.clone(),
+        _ => continue,
+      },
+      _ => continue,
+    };
+
+    // Extract the ColorSpace sub-dictionary from Resources
+    let cs_dict = match resources_dict.get(b"ColorSpace").ok() {
+      Some(Object::Dictionary(d)) => d.clone(),
+      Some(Object::Reference(id)) => match doc.objects.get(id) {
+        Some(Object::Dictionary(d)) => d.clone(),
+        _ => Dictionary::new(),
+      },
+      _ => Dictionary::new(),
+    };
+
+    // Extract the XObject sub-dictionary from Resources
+    let xobj_dict = match resources_dict.get(b"XObject").ok() {
+      Some(Object::Dictionary(d)) => d.clone(),
+      Some(Object::Reference(id)) => match doc.objects.get(id) {
+        Some(Object::Dictionary(d)) => d.clone(),
+        _ => continue,
+      },
+      _ => continue,
+    };
+
+    // For each image XObject, resolve its colour space component count
+    for (_, xobj_ref) in xobj_dict.iter() {
+      let xobj_id = match xobj_ref {
+        Object::Reference(id) => *id,
+        _ => continue,
+      };
+      if map.contains_key(&xobj_id) {
+        continue;
+      }
+      let xobj_stream = match doc.objects.get(&xobj_id) {
+        Some(Object::Stream(s)) if is_image_stream(s) => s,
+        _ => continue,
+      };
+
+      let n = resolve_colorspace_components(&xobj_stream.dict, &cs_dict, doc);
+      if let Some(n) = n {
+        map.insert(xobj_id, n);
+      }
+    }
+  }
+
+  map
+}
+
+/// Resolve a colour space to its component count, consulting the page-level
+/// colour space dictionary for named entries.
+fn resolve_colorspace_components(
+  img_dict: &Dictionary,
+  page_cs_dict: &Dictionary,
+  doc: &Document,
+) -> Option<usize> {
+  let cs = img_dict.get(b"ColorSpace").ok()?;
+
+  match cs {
+    // Direct name: DeviceRGB / DeviceGray / DeviceCMYK or a page-level alias
+    Object::Name(name) => match name.as_slice() {
+      b"DeviceGray" | b"CalGray" => Some(1),
+      b"DeviceRGB" | b"CalRGB" => Some(3),
+      b"DeviceCMYK" => Some(4),
+      alias => {
+        // Look up the alias in the page's ColorSpace dict
+        let cs_val = page_cs_dict.get(alias).ok()?;
+        resolve_cs_value(cs_val, doc)
+      }
+    },
+    // Inline array
+    Object::Array(_) | Object::Reference(_) => resolve_cs_value(cs, doc),
+    _ => None,
+  }
+}
+
+fn resolve_cs_value(cs: &Object, doc: &Document) -> Option<usize> {
+  match cs {
+    Object::Name(name) => match name.as_slice() {
+      b"DeviceGray" | b"CalGray" => Some(1),
+      b"DeviceRGB" | b"CalRGB" => Some(3),
+      b"DeviceCMYK" => Some(4),
+      _ => None,
+    },
+    Object::Array(arr) => match arr.first() {
+      Some(Object::Name(name)) => match name.as_slice() {
+        b"ICCBased" => {
+          let ref_id = match arr.get(1) {
+            Some(Object::Reference(id)) => *id,
+            _ => return None,
+          };
+          match doc.objects.get(&ref_id) {
+            Some(Object::Stream(s)) => dict_integer(&s.dict, b"N").map(|n| n as usize),
+            _ => None,
+          }
+        }
+        b"CalRGB" => Some(3),
+        b"CalGray" => Some(1),
+        b"DeviceN" => {
+          // Component count is the length of the Names array (second element)
+          match arr.get(1) {
+            Some(Object::Array(names)) => Some(names.len()),
+            _ => None,
+          }
+        }
+        b"Indexed" => Some(1), // Indexed images use 1 byte per pixel (palette index)
+        _ => None,
+      },
+      _ => None,
+    },
+    Object::Reference(id) => match doc.objects.get(id) {
+      Some(obj) => resolve_cs_value(obj, doc),
+      None => None,
+    },
+    _ => None,
+  }
 }
 
 /// Resolve the component count for an ICCBased color space by following the reference.
@@ -318,10 +471,19 @@ fn recompress_image_stream(stream: &Stream, quality: u8, max_dimension: Option<u
 }
 
 fn decode_flate_image(stream: &Stream, icc_components: Option<usize>) -> Option<image::DynamicImage> {
-  // Decompress zlib data
-  let mut decoder = ZlibDecoder::new(stream.content.as_slice());
-  let mut raw = Vec::new();
-  decoder.read_to_end(&mut raw).ok()?;
+  // Try zlib first; some PDFs use raw deflate without the zlib wrapper
+  let raw = {
+    let mut buf = Vec::new();
+    let ok = ZlibDecoder::new(stream.content.as_slice()).read_to_end(&mut buf).is_ok() && !buf.is_empty();
+    if ok {
+      buf
+    } else {
+      let mut buf2 = Vec::new();
+      DeflateDecoder::new(stream.content.as_slice()).read_to_end(&mut buf2).ok()?;
+      if buf2.is_empty() { return None; }
+      buf2
+    }
+  };
 
   let width = dict_integer(&stream.dict, b"Width")? as usize;
   let height = dict_integer(&stream.dict, b"Height")? as usize;
