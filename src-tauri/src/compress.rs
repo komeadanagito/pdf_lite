@@ -114,18 +114,21 @@ pub fn compress_pdf_at_path(app: &AppHandle, path: &Path, mode: CompressionMode)
   match mode {
     CompressionMode::Lossless => {}
     CompressionMode::Light => {
+      // Limit to 1800 px longest side (≈150 dpi for A4) + quality 80: visually near-lossless
       emit_progress(app, path, "图片压缩", 2, 4);
-      recompress_images(app, path, &mut document, 85, None)?;
+      recompress_images(app, path, &mut document, 80, Some(1800))?;
     }
     CompressionMode::Standard => {
+      // 1500 px + quality 68: good balance between size and readability
       emit_progress(app, path, "图片压缩", 2, 4);
-      recompress_images(app, path, &mut document, 80, None)?;
+      recompress_images(app, path, &mut document, 68, Some(1500))?;
       emit_progress(app, path, "清理冗余内容", 3, 4);
       strip_interactive_content(&mut document, true);
     }
     CompressionMode::Extreme => {
+      // 1200 px + quality 50: maximum compression, still legible text
       emit_progress(app, path, "图片压缩", 2, 4);
-      recompress_images(app, path, &mut document, 72, Some(2200))?;
+      recompress_images(app, path, &mut document, 50, Some(1200))?;
       emit_progress(app, path, "清理冗余内容", 3, 4);
       strip_interactive_content(&mut document, true);
       strip_extreme_metadata(&mut document);
@@ -480,55 +483,62 @@ fn decode_flate_image(stream: &Stream, icc_components: Option<usize>) -> Option<
     } else {
       let mut buf2 = Vec::new();
       DeflateDecoder::new(stream.content.as_slice()).read_to_end(&mut buf2).ok()?;
-      if buf2.is_empty() { return None; }
+      if buf2.is_empty() {
+        return None;
+      }
       buf2
     }
   };
 
-  let width = dict_integer(&stream.dict, b"Width")? as usize;
-  let height = dict_integer(&stream.dict, b"Height")? as usize;
+  let img_width = dict_integer(&stream.dict, b"Width")? as usize;
+  let img_height = dict_integer(&stream.dict, b"Height")? as usize;
   let bits = dict_integer(&stream.dict, b"BitsPerComponent").unwrap_or(8);
   if bits != 8 {
     return None;
   }
 
-  // Use directly-known color space, pre-resolved ICCBased count, or infer from data size
-  let components = color_space_components(&stream.dict)
+  // Parse DecodeParms — these fields are the most authoritative source for FlateDecode layout
+  let decode_parms: Option<&Dictionary> = stream.dict.get(b"DecodeParms").ok().and_then(|p| match p {
+    Object::Dictionary(d) => Some(d),
+    _ => None,
+  });
+
+  let predictor = decode_parms.and_then(|d| dict_integer(d, b"Predictor")).unwrap_or(1);
+
+  // DecodeParms.Colors is the most reliable component count for FlateDecode streams.
+  // Most PDF writers (Adobe, WeChat, scanners) always include it.
+  let colors_from_parms = decode_parms.and_then(|d| dict_integer(d, b"Colors")).map(|c| c as usize);
+
+  // Columns may differ from stream Width in edge cases (padding rows)
+  let stride_width = decode_parms
+    .and_then(|d| dict_integer(d, b"Columns"))
+    .map(|c| c as usize)
+    .unwrap_or(img_width);
+
+  // Resolution order: DecodeParms.Colors → ColorSpace dict → pre-resolved ICC → data-size inference
+  let components = colors_from_parms
+    .or_else(|| color_space_components(&stream.dict))
     .or(icc_components)
-    .or_else(|| infer_components_from_size(&raw, width, height, stream));
-
-  // Undo PNG prediction filter if present (Predictor 10-15)
-  let components = components?;
-
-  let predictor = stream
-    .dict
-    .get(b"DecodeParms")
-    .ok()
-    .and_then(|p| match p {
-      Object::Dictionary(d) => dict_integer(d, b"Predictor"),
-      _ => None,
-    })
-    .unwrap_or(1);
+    .or_else(|| infer_components_from_size(&raw, stride_width, img_height, predictor >= 10))?;
 
   let pixels = if predictor >= 10 {
-    undo_png_prediction(&raw, width, height, components)?
+    undo_png_prediction(&raw, stride_width, img_height, components)?
   } else {
     raw
   };
 
   match components {
     1 => {
-      let img = image::GrayImage::from_raw(width as u32, height as u32, pixels)?;
+      let img = image::GrayImage::from_raw(img_width as u32, img_height as u32, pixels)?;
       Some(image::DynamicImage::ImageLuma8(img))
     }
     3 => {
-      let img = image::RgbImage::from_raw(width as u32, height as u32, pixels)?;
+      let img = image::RgbImage::from_raw(img_width as u32, img_height as u32, pixels)?;
       Some(image::DynamicImage::ImageRgb8(img))
     }
     4 => {
-      // CMYK → convert to RGB before re-encoding as JPEG
       let rgb = cmyk_to_rgb(&pixels);
-      let img = image::RgbImage::from_raw(width as u32, height as u32, rgb)?;
+      let img = image::RgbImage::from_raw(img_width as u32, img_height as u32, rgb)?;
       Some(image::DynamicImage::ImageRgb8(img))
     }
     _ => None,
@@ -632,28 +642,15 @@ fn color_space_components(dict: &Dictionary) -> Option<usize> {
 }
 
 /// Infer component count from decompressed data size when color space is unresolvable.
-fn infer_components_from_size(raw: &[u8], width: usize, height: usize, stream: &Stream) -> Option<usize> {
+fn infer_components_from_size(raw: &[u8], width: usize, height: usize, has_predictor: bool) -> Option<usize> {
   if width == 0 || height == 0 {
     return None;
   }
-  let has_predictor = stream
-    .dict
-    .get(b"DecodeParms")
-    .ok()
-    .and_then(|p| match p {
-      Object::Dictionary(d) => dict_integer(d, b"Predictor"),
-      _ => None,
-    })
-    .map(|p| p >= 10)
-    .unwrap_or(false);
-
-  // With PNG predictor: each row has an extra filter-type byte
-  let pixels_per_row = width;
   for &n in &[1usize, 3, 4] {
     let expected = if has_predictor {
-      height * (pixels_per_row * n + 1)
+      height * (width * n + 1) // each row has a leading filter-type byte
     } else {
-      height * pixels_per_row * n
+      height * width * n
     };
     if raw.len() == expected {
       return Some(n);

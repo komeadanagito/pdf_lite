@@ -55,10 +55,10 @@ function reducer(state: PdfFileItem[], action: Action): PdfFileItem[] {
 }
 
 const modeDescriptions: Record<CompressionMode, string> = {
-  0: '无损：结构优化与流重压缩',
-  1: '轻度：无损 + JPEG 重压缩',
-  2: '标准：轻度 + 删除书签/注释/表单',
-  3: '极限：标准 + 去元数据 + 更激进图片压缩'
+  0: '无损：仅优化文件结构，画质零损失',
+  1: '轻度：缩至 1800px + JPEG 80，视觉无差',
+  2: '标准：缩至 1500px + JPEG 68，清晰可读',
+  3: '极限：缩至 1200px + JPEG 50，最大压缩率'
 };
 
 function formatBytes(bytes: number): string {
