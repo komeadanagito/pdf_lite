@@ -8,7 +8,12 @@ use std::{
 use flate2::read::ZlibDecoder;
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::{
+  atomic::{AtomicUsize, Ordering},
+  Arc,
+};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,19 +113,19 @@ pub fn compress_pdf_at_path(app: &AppHandle, path: &Path, mode: CompressionMode)
   match mode {
     CompressionMode::Lossless => {}
     CompressionMode::Light => {
-      emit_progress(app, path, "recompressing images", 2, 4);
-      recompress_images(&mut document, 85, None)?;
+      emit_progress(app, path, "图片压缩", 2, 4);
+      recompress_images(app, path, &mut document, 85, None)?;
     }
     CompressionMode::Standard => {
-      emit_progress(app, path, "recompressing images", 2, 4);
-      recompress_images(&mut document, 80, None)?;
-      emit_progress(app, path, "stripping annotations", 3, 4);
+      emit_progress(app, path, "图片压缩", 2, 4);
+      recompress_images(app, path, &mut document, 80, None)?;
+      emit_progress(app, path, "清理冗余内容", 3, 4);
       strip_interactive_content(&mut document, true);
     }
     CompressionMode::Extreme => {
-      emit_progress(app, path, "recompressing images", 2, 4);
-      recompress_images(&mut document, 72, Some(2200))?;
-      emit_progress(app, path, "stripping annotations", 3, 4);
+      emit_progress(app, path, "图片压缩", 2, 4);
+      recompress_images(app, path, &mut document, 72, Some(2200))?;
+      emit_progress(app, path, "清理冗余内容", 3, 4);
       strip_interactive_content(&mut document, true);
       strip_extreme_metadata(&mut document);
     }
@@ -158,28 +163,78 @@ fn compress_lossless(doc: &mut Document) {
   let _ = doc.compress();
 }
 
-fn recompress_images(doc: &mut Document, quality: u8, max_dimension: Option<u32>) -> Result<(), String> {
+fn recompress_images(
+  app: &AppHandle,
+  path: &Path,
+  doc: &mut Document,
+  quality: u8,
+  max_dimension: Option<u32>,
+) -> Result<(), String> {
+  // ── Phase 1: collect stream data (immutable pass, enables cloning for rayon) ──
   let image_ids: Vec<ObjectId> = doc
     .objects
     .iter()
-    .filter_map(|(id, object)| match object {
-      Object::Stream(stream) if is_image_stream(stream) => Some(*id),
+    .filter_map(|(id, obj)| match obj {
+      Object::Stream(s) if is_image_stream(s) => Some(*id),
       _ => None,
     })
     .collect();
 
-  for id in image_ids {
-    // Resolve ICCBased component count before mutably borrowing the stream
-    let icc_components = resolve_icc_components(doc, id);
+  let tasks: Vec<(ObjectId, Vec<u8>, Dictionary, Option<usize>)> = image_ids
+    .iter()
+    .filter_map(|&id| {
+      let (content, dict) = match doc.objects.get(&id) {
+        Some(Object::Stream(s)) => (s.content.clone(), s.dict.clone()),
+        _ => return None,
+      };
+      let icc = resolve_icc_components(doc, id);
+      Some((id, content, dict, icc))
+    })
+    .collect();
 
-    if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
-      if let Some(new_bytes) = recompress_image_stream(stream, quality, max_dimension, icc_components) {
-        stream.content = new_bytes;
-        stream.dict.remove(b"Filter");
-        stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
-        stream.dict.set("Length", Object::Integer(stream.content.len() as i64));
-        stream.dict.remove(b"DecodeParms");
+  let total = tasks.len();
+  if total == 0 {
+    return Ok(());
+  }
+
+  // ── Phase 2: process all images in parallel across CPU cores ──
+  let done = Arc::new(AtomicUsize::new(0));
+  let app2 = app.clone();
+  let path_str = path.to_string_lossy().to_string();
+  let done2 = Arc::clone(&done);
+
+  let results: Vec<(ObjectId, Vec<u8>)> = tasks
+    .into_par_iter()
+    .filter_map(|(id, content, dict, icc)| {
+      let stream = Stream { dict, content, allows_compression: false, start_position: None };
+      let new_bytes = recompress_image_stream(&stream, quality, max_dimension, icc)?;
+
+      // Emit granular progress every 3 completions so UI stays responsive
+      let n = done2.fetch_add(1, Ordering::Relaxed) + 1;
+      if n % 3 == 0 || n == total {
+        let _ = app2.emit(
+          "compress-progress",
+          ProgressEvent {
+            path: path_str.clone(),
+            stage: format!("图片 {n}/{total}"),
+            completed: 2,
+            total: 4,
+          },
+        );
       }
+
+      Some((id, new_bytes))
+    })
+    .collect();
+
+  // ── Phase 3: write results back (single-threaded) ──
+  for (id, new_bytes) in results {
+    if let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) {
+      stream.dict.remove(b"Filter");
+      stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+      stream.dict.set("Length", Object::Integer(new_bytes.len() as i64));
+      stream.dict.remove(b"DecodeParms");
+      stream.content = new_bytes;
     }
   }
 
@@ -215,7 +270,7 @@ fn resolve_icc_components(doc: &Document, image_id: ObjectId) -> Option<usize> {
   }
 }
 
-fn recompress_image_stream(stream: &mut Stream, quality: u8, max_dimension: Option<u32>, icc_components: Option<usize>) -> Option<Vec<u8>> {
+fn recompress_image_stream(stream: &Stream, quality: u8, max_dimension: Option<u32>, icc_components: Option<usize>) -> Option<Vec<u8>> {
   // Determine current filter - only handle Name filters (not arrays of filters)
   let filter_name = match stream.dict.get(b"Filter").ok()? {
     Object::Name(name) => name.clone(),
@@ -262,7 +317,6 @@ fn recompress_image_stream(stream: &mut Stream, quality: u8, max_dimension: Opti
   Some(new_bytes)
 }
 
-/// Decode a FlateDecode image stream into a DynamicImage.
 fn decode_flate_image(stream: &Stream, icc_components: Option<usize>) -> Option<image::DynamicImage> {
   // Decompress zlib data
   let mut decoder = ZlibDecoder::new(stream.content.as_slice());
