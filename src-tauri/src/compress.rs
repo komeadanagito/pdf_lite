@@ -15,7 +15,7 @@ use std::sync::{
   atomic::{AtomicUsize, Ordering},
   Arc,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, path::BaseDirectory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -110,7 +110,7 @@ pub fn compress_pdf_at_path(
   let output = output_path_for(path);
 
   // Try Ghostscript first (works for ALL types of PDF)
-  if let Some(gs) = find_ghostscript() {
+  if let Some(gs) = find_ghostscript(app) {
     emit(app, path, "Ghostscript 压缩中", 1, 3);
     compress_with_gs(&gs, path, &output, mode)?;
   } else {
@@ -168,15 +168,24 @@ pub fn compress_pdf_at_path(
 
 // ═══ Ghostscript engine ════════════════════════════════════════════
 
-fn find_ghostscript() -> Option<PathBuf> {
-  // 1. Check PATH
+fn find_ghostscript(app: &AppHandle) -> Option<PathBuf> {
+  // 1. Bundled GS inside app resources (highest priority)
+  for exe_name in &["resources/gs/bin/gswin64c.exe", "resources/gs/bin/gswin32c.exe"] {
+    if let Ok(bundled) = app.path().resolve(exe_name, BaseDirectory::Resource) {
+      if bundled.exists() {
+        return Some(bundled);
+      }
+    }
+  }
+
+  // 2. Check PATH
   for name in &["gswin64c", "gswin32c", "gs"] {
     if Command::new(name).arg("--version").output().is_ok() {
       return Some(PathBuf::from(name));
     }
   }
 
-  // 2. Common install locations on Windows
+  // 3. Common install locations on Windows
   #[cfg(target_os = "windows")]
   {
     for base in &["C:\\Program Files\\gs", "C:\\Program Files (x86)\\gs"] {
@@ -222,8 +231,20 @@ fn compress_with_gs(
     CompressionMode::Extreme => "/screen",
   };
 
-  // Build the GS command with fine-grained control
   let mut cmd = Command::new(gs_path);
+
+  // Set working dir to the GS bin directory so it can find gsdll*.dll and lib/
+  if let Some(bin_dir) = gs_path.parent() {
+    cmd.current_dir(bin_dir);
+    // Point GS to sibling lib/ directory for PostScript resources
+    if let Some(gs_root) = bin_dir.parent() {
+      let lib_dir = gs_root.join("lib");
+      if lib_dir.is_dir() {
+        cmd.arg(format!("-I{}", lib_dir.to_string_lossy()));
+      }
+    }
+  }
+
   cmd
     .arg("-sDEVICE=pdfwrite")
     .arg("-dCompatibilityLevel=1.5")

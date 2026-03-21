@@ -2,11 +2,13 @@ import { useEffect, useMemo, useReducer, useState, type DragEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import Toolbar from './components/Toolbar';
 import FileTable from './components/FileTable';
 import ModeSelector from './components/ModeSelector';
 import DropZone from './components/DropZone';
+import TitleBar from './components/TitleBar';
 import type { CompressResult, CompressionMode, CompressionProgress, PdfFileItem, PdfInfo } from './types';
 
 type Action =
@@ -98,6 +100,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<CompressionProgress | null>(null);
 
+  const appWindow = getCurrentWindow();
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<CompressionProgress>('compress-progress', (event) => {
@@ -175,9 +179,19 @@ export default function App() {
     setDragActive(false);
   }
 
+  const subtitle = progress
+    ? `${progress.stage}… ${progress.completed}/${progress.total}`
+    : '点击添加或拖入 PDF 文件';
+
   return (
     <DropZone active={dragActive} onDragOver={() => setDragActive(true)} onDragLeave={() => setDragActive(false)} onDrop={handleDrop}>
       <div className="app-shell">
+
+        <TitleBar
+          appWindow={appWindow}
+          fileCount={files.length}
+          selectedCount={selectedCount}
+        />
 
         <header className="app-header">
           <div className="header-left">
@@ -190,21 +204,7 @@ export default function App() {
             </div>
             <div>
               <div className="app-title">PDF Lite</div>
-              <div className="app-subtitle">
-                {progress
-                  ? `${progress.stage}… ${progress.completed}/${progress.total}`
-                  : '点击添加或拖入 PDF 文件'}
-              </div>
-            </div>
-          </div>
-          <div className="header-stats">
-            <div className="stat-item">
-              <div className="stat-value">{files.length}</div>
-              <div className="stat-label">文件数</div>
-            </div>
-            <div className="stat-item">
-              <div className="stat-value">{selectedCount}</div>
-              <div className="stat-label">已选</div>
+              <div className="app-subtitle">{subtitle}</div>
             </div>
           </div>
         </header>

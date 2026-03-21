@@ -14,17 +14,26 @@
       {
         "label": "main",
         "title": "PDF Lite",
-        "width": 800,
-        "height": 600,
-        "minWidth": 800,
-        "minHeight": 600,
+        "width": 860,
+        "height": 640,
+        "minWidth": 760,
+        "minHeight": 520,
         "resizable": true,
-        "dragDropEnabled": true
+        "decorations": false,
+        "transparent": true,
+        "dragDropEnabled": true,
+        "windowEffects": {
+          "effects": ["acrylic", "mica"],
+          "color": [255, 255, 255, 20]
+        }
       }
     ]
   },
   "bundle": {
     "active": true,
+    "resources": [
+      "resources/gs/"
+    ],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",

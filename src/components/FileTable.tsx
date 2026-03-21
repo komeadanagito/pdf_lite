@@ -39,7 +39,8 @@ export default function FileTable({ files, onToggleItem, onToggleAll }: FileTabl
             <line x1="9" y1="15" x2="15" y2="15" />
           </svg>
         </div>
-        <p>拖入 PDF 文件，或点击"添加文件"</p>
+        <p>拖入 PDF 文件，或点击上方「添加文件」</p>
+        <span className="empty-hint">支持批量添加与压缩</span>
       </div>
     );
   }
@@ -48,15 +49,15 @@ export default function FileTable({ files, onToggleItem, onToggleAll }: FileTabl
     <table className="file-table">
       <thead>
         <tr>
-          <th style={{ width: 48 }}>
+          <th style={{ width: 44 }}>
             <input type="checkbox" checked={allSelected} onChange={(e) => onToggleAll(e.target.checked)} />
           </th>
           <th>文件名</th>
-          <th style={{ width: 100 }}>页数</th>
-          <th style={{ width: 100 }}>原始大小</th>
-          <th style={{ width: 100 }}>压缩后</th>
-          <th style={{ width: 90 }}>节省</th>
-          <th style={{ width: 90 }}>状态</th>
+          <th style={{ width: 72 }}>页数</th>
+          <th style={{ width: 90 }}>原始大小</th>
+          <th style={{ width: 90 }}>压缩后</th>
+          <th style={{ width: 80 }}>节省</th>
+          <th style={{ width: 82 }}>状态</th>
         </tr>
       </thead>
       <tbody>
@@ -77,7 +78,7 @@ export default function FileTable({ files, onToggleItem, onToggleAll }: FileTabl
               <td>{file.compressedSize ? formatBytes(file.compressedSize) : '-'}</td>
               <td>
                 {ratio !== undefined
-                  ? <span style={{ color: ratio >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 500 }}>
+                  ? <span style={{ color: ratio >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
                       {ratio >= 0 ? `↓ ${ratio.toFixed(1)}%` : `↑ ${Math.abs(ratio).toFixed(1)}%`}
                     </span>
                   : '-'}
