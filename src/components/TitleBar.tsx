@@ -35,7 +35,7 @@ export default function TitleBar({ appWindow, fileCount, selectedCount }: TitleB
             </svg>
           </button>
         </div>
-        <span className="titlebar-title">PDF Lite</span>
+        <span className="titlebar-title">File Lite</span>
       </div>
 
       <div className="titlebar-right">

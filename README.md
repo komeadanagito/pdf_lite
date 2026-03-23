@@ -1,54 +1,82 @@
-# PDF Lite
+# File Lite
 
-一个使用 Rust + Tauri 2 + React 构建的跨平台 PDF 压缩桌面应用。
+使用 Rust + Tauri 2 + React 构建的跨平台文件压缩应用，支持 PDF、图片和视频压缩。
 
 ## 功能
 
-- 四档压缩模式：无损、轻度、标准、极限
-- 支持批量添加 PDF 文件
-- 支持拖拽添加文件
-- 支持压缩后大小对比
-- 支持任务进度事件
+### PDF 压缩
+- 四档模式：无损、轻度(200DPI)、标准(150DPI)、极限(100DPI)
+- Ghostscript 引擎优先，纯 Rust 回退
+- 批量添加、拖拽添加
+
+### 图片压缩
+- 支持 JPG、PNG、WebP、BMP、TIFF、GIF、SVG
+- PNG：oxipng 无损优化 + imagequant 有损量化
+- WebP：质量重编码
+- SVG：usvg 解析简化
+- 四档模式：无损、轻度(Q85)、标准(Q70)、极限(Q50)
+
+### 视频压缩
+- 支持 MP4、MOV、AVI、MKV
+- FFmpeg H.264 编码
+- 四档模式：无损(重封装)、轻度(CRF23)、标准(CRF28+1080p)、极限(CRF32+720p)
+
+### 界面
+- Apple 风格毛玻璃 UI
+- 自定义标题栏
+- Tab 切换（PDF / 图片 / 视频）
+- 移动端自适应布局
 
 ## 开发运行
 
 ```bash
-source "$HOME/.cargo/env"
 npm install
 npm run tauri:dev
 ```
 
 ## 打包
 
-### 准备 Ghostscript（仅首次）
+### Windows
 
-打包前需要将 Ghostscript 的运行文件复制到项目中，这样打包后的应用无需用户额外安装 Ghostscript：
+#### 1. 准备 Ghostscript（PDF 压缩引擎）
 
-1. 下载并安装 [Ghostscript](https://ghostscript.com/releases/gsdnld.html)（10.x 推荐）。
-2. 将安装目录中的以下子目录复制到 `src-tauri/resources/gs/`：
+下载 [Ghostscript](https://ghostscript.com/releases/gsdnld.html)（10.x 推荐），将以下目录复制到 `src-tauri/resources/gs/`：
 
 ```
 src-tauri/resources/gs/
-  bin/          ← gswin32c.exe (或 gswin64c.exe) + gsdll*.dll
+  bin/          ← gswin64c.exe + gsdll*.dll
   lib/          ← 完整复制
   Resource/     ← 完整复制
   iccprofiles/  ← 完整复制
 ```
 
-> **注意**：Ghostscript 使用 AGPL 许可证。分发包含 Ghostscript 的应用时，请遵守 AGPL 合规要求。
+#### 2. 准备 FFmpeg（视频压缩引擎）
 
-### 执行打包
+下载 [FFmpeg](https://ffmpeg.org/download.html) 静态构建版，将 `ffmpeg.exe` 放入：
 
-```bash
-npm run tauri build
+```
+src-tauri/resources/ffmpeg/
+  ffmpeg.exe
 ```
 
-## Windows 使用方式
+#### 3. 执行打包
 
-在 Windows 上，推荐使用打包后的安装器直接安装和启动：
+```bash
+npm run tauri:build
+```
 
-1. 运行 `npm run tauri build` 生成安装包。
-2. 在 `src-tauri/target/release/bundle/nsis/` 目录中找到 `setup.exe` 安装器。
-3. 双击安装器完成安装。
-4. 安装完成后，可以从桌面快捷方式或开始菜单直接启动 `PDF Lite`。
-5. 不需要手动打开终端，也不需要安装 Rust / Ghostscript 等环境。
+安装包在 `src-tauri/target/release/bundle/nsis/` 目录下。
+
+### Android
+
+需要先安装 Android SDK、NDK 和 JDK，然后：
+
+```bash
+npm run tauri android init
+npm run tauri android build
+```
+
+## 许可证
+
+- Ghostscript 使用 AGPL 许可证，分发时请遵守 AGPL 合规要求
+- FFmpeg 使用 LGPL/GPL 许可证，请根据所用构建版本遵守相应要求

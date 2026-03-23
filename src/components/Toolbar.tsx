@@ -18,7 +18,6 @@ export default function Toolbar({
       <button className="toolbar-btn" onClick={onAddFiles} disabled={disabled}>
         添加文件
       </button>
-      <div className="toolbar-sep" />
       <button className="toolbar-btn" onClick={onRemoveSelected} disabled={disabled || selectedCount === 0}>
         移除选中 {selectedCount > 0 ? `(${selectedCount})` : ''}
       </button>

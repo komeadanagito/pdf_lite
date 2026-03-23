@@ -3,17 +3,10 @@ import type { CompressionMode } from '../types';
 interface ModeSelectorProps {
   mode: CompressionMode;
   onChange: (mode: CompressionMode) => void;
-  descriptions: Record<CompressionMode, string>;
+  options: Array<{ value: CompressionMode; label: string; short: string }>;
 }
 
-const options: Array<{ value: CompressionMode; label: string; short: string }> = [
-  { value: 0, label: '无损', short: '仅优化结构' },
-  { value: 1, label: '轻度', short: '200 DPI' },
-  { value: 2, label: '标准', short: '150 DPI' },
-  { value: 3, label: '极限', short: '100 DPI' }
-];
-
-export default function ModeSelector({ mode, onChange }: ModeSelectorProps) {
+export default function ModeSelector({ mode, onChange, options }: ModeSelectorProps) {
   return (
     <div className="mode-selector">
       {options.map((opt) => (

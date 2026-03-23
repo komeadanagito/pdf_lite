@@ -25,7 +25,7 @@ export default function DropZone({ active, onDragOver, onDragLeave, onDrop, chil
               <polyline points="7 10 12 15 17 10" />
               <line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            <span>松开以添加 PDF</span>
+            <span>松开以添加文件</span>
           </div>
         </div>
       )}

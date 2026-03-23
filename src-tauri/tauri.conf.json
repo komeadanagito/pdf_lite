@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "PDF Lite",
-  "version": "0.1.0",
-  "identifier": "com.pdflite.desktop",
+  "productName": "File Lite",
+  "version": "0.2.0",
+  "identifier": "com.filelite.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "PDF Lite",
+        "title": "File Lite",
         "width": 860,
         "height": 640,
         "minWidth": 760,
@@ -32,7 +32,8 @@
   "bundle": {
     "active": true,
     "resources": [
-      "resources/gs/"
+      "resources/gs/",
+      "resources/ffmpeg/"
     ],
     "windows": {
       "webviewInstallMode": {

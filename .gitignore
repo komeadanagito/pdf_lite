@@ -16,8 +16,9 @@ src-tauri/gen
 vite.config.js
 vite.config.d.ts
 
-# Bundled Ghostscript binaries (too large for VCS)
+# Bundled binaries (too large for VCS)
 src-tauri/resources/gs/
+src-tauri/resources/ffmpeg/
 
 # Editor / OS
 .vscode/
