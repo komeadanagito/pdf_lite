@@ -43,7 +43,7 @@ pub fn compress_video_at_path(
     let output = output_path_for(path);
 
     let ffmpeg = find_ffmpeg(app).ok_or_else(|| {
-        "未找到 FFmpeg。请将 ffmpeg.exe 放入 src-tauri/resources/ffmpeg/ 目录后重新打包".to_string()
+        ffmpeg_missing_message()
     })?;
 
     emit(app, path, "FFmpeg 压缩中", 1, 3);
@@ -99,6 +99,12 @@ fn find_ffmpeg(app: &AppHandle) -> Option<PathBuf> {
         }
     }
 
+    for candidate in ffmpeg_path_candidates() {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
     let mut probe = Command::new("ffmpeg");
     probe.arg("-version");
     #[cfg(target_os = "windows")]
@@ -111,6 +117,44 @@ fn find_ffmpeg(app: &AppHandle) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn ffmpeg_path_candidates() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/opt/homebrew/bin/ffmpeg"),
+        PathBuf::from("/usr/local/bin/ffmpeg"),
+        PathBuf::from("/usr/bin/ffmpeg"),
+    ]
+}
+
+fn ffmpeg_missing_message() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return "未找到 FFmpeg。Mac 可通过 Homebrew 安装：brew install ffmpeg，或将 ffmpeg 放入 src-tauri/resources/ffmpeg/ 后重新打包".to_string();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return "未找到 FFmpeg。请将 ffmpeg.exe 放入 src-tauri/resources/ffmpeg/ 目录后重新打包".to_string();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "未找到 FFmpeg。请安装 ffmpeg，或将可执行文件放入 src-tauri/resources/ffmpeg/ 后重新打包".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffmpeg_path_candidates_include_homebrew_locations_on_macos() {
+        let candidates = ffmpeg_path_candidates();
+
+        assert!(candidates.contains(&PathBuf::from("/opt/homebrew/bin/ffmpeg")));
+        assert!(candidates.contains(&PathBuf::from("/usr/local/bin/ffmpeg")));
+    }
 }
 
 fn compress_with_ffmpeg(

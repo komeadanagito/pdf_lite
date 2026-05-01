@@ -173,7 +173,11 @@ pub fn compress_pdf_at_path(
 
 fn find_ghostscript(app: &AppHandle) -> Option<PathBuf> {
   // 1. Bundled GS inside app resources (highest priority)
-  for exe_name in &["resources/gs/bin/gswin64c.exe", "resources/gs/bin/gswin32c.exe"] {
+  for exe_name in &[
+    "resources/gs/bin/gswin64c.exe",
+    "resources/gs/bin/gswin32c.exe",
+    "resources/gs/bin/gs",
+  ] {
     if let Ok(bundled) = app.path().resolve(exe_name, BaseDirectory::Resource) {
       if bundled.exists() {
         return Some(bundled);
@@ -181,7 +185,14 @@ fn find_ghostscript(app: &AppHandle) -> Option<PathBuf> {
     }
   }
 
-  // 2. Check PATH
+  // 2. Check common platform-specific install locations
+  for candidate in ghostscript_path_candidates() {
+    if candidate.exists() {
+      return Some(candidate);
+    }
+  }
+
+  // 3. Check PATH
   for name in &["gswin64c", "gswin32c", "gs"] {
     let mut probe = Command::new(name);
     probe.arg("--version");
@@ -192,7 +203,7 @@ fn find_ghostscript(app: &AppHandle) -> Option<PathBuf> {
     }
   }
 
-  // 3. Common install locations on Windows
+  // 4. Common install locations on Windows
   #[cfg(target_os = "windows")]
   {
     for base in &["C:\\Program Files\\gs", "C:\\Program Files (x86)\\gs"] {
@@ -219,6 +230,27 @@ fn find_ghostscript(app: &AppHandle) -> Option<PathBuf> {
   }
 
   None
+}
+
+fn ghostscript_path_candidates() -> Vec<PathBuf> {
+  vec![
+    PathBuf::from("/opt/homebrew/bin/gs"),
+    PathBuf::from("/usr/local/bin/gs"),
+    PathBuf::from("/usr/bin/gs"),
+  ]
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn ghostscript_path_candidates_include_homebrew_locations_on_macos() {
+    let candidates = ghostscript_path_candidates();
+
+    assert!(candidates.contains(&PathBuf::from("/opt/homebrew/bin/gs")));
+    assert!(candidates.contains(&PathBuf::from("/usr/local/bin/gs")));
+  }
 }
 
 fn compress_with_gs(
